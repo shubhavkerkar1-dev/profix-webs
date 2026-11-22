@@ -1,0 +1,176 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && getUserRole() == 'admin';
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- 1. Users collection ---
+    match /users/{userId} {
+      // Authenticated users can read their own profile, or admins can read any
+      // In professional search, customers can read basic professional contact names
+      allow read: if isAuthenticated();
+
+      // Creation allowed during initial registration with self UID
+      allow create: if isAuthenticated() 
+        && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.role in ['customer', 'professional']
+        && request.resource.data.role != 'admin'; // Cannot self-assign admin
+
+      // Update allowed by owner, but CANNOT change role or uid
+      allow update: if (isOwner(userId) && request.resource.data.role == resource.data.role && request.resource.data.uid == resource.data.uid)
+        || isAdmin();
+
+      allow delete: if isAdmin();
+    }
+
+    // --- 2. Professional Profiles collection ---
+    match /professionalProfiles/{userId} {
+      // Publicly readable by all authenticated users for discovery
+      allow read: if isAuthenticated();
+
+      // Professional can create their own profile
+      allow create: if isOwner(userId)
+        && request.resource.data.userId == userId
+        && request.resource.data.verificationStatus == 'PENDING'; // Starts as pending
+
+      // Professional can update availability, bio, etc., but CANNOT change verificationStatus
+      // Only Admin can change verificationStatus
+      allow update: if (
+        isOwner(userId) 
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.verificationStatus == resource.data.verificationStatus
+      ) || isAdmin();
+
+      allow delete: if isAdmin();
+    }
+
+    // --- 3. Service Categories collection ---
+    match /serviceCategories/{categoryId} {
+      // Any authenticated user can read active categories
+      allow read: if isAuthenticated();
+
+      // Only administrators can create, update, or deactivate categories
+      allow write: if isAdmin();
+    }
+
+    // --- 4. Professional Services collection ---
+    match /professionalServices/{serviceId} {
+      // Publicly readable by authenticated users
+      allow read: if isAuthenticated();
+
+      // Only owner professional can create their services
+      allow create: if isAuthenticated()
+        && request.resource.data.professionalId == request.auth.uid;
+
+      // Only owner professional can update or delete
+      allow update, delete: if isAuthenticated()
+        && (resource.data.professionalId == request.auth.uid || isAdmin());
+    }
+
+    // --- 5. Service Requests collection ---
+    match /serviceRequests/{requestId} {
+      // Read allowed only to involved customer, involved professional, or admin
+      allow read: if isAuthenticated() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.professionalId == request.auth.uid ||
+        isAdmin()
+      );
+
+      // Customer creates a request addressed to a specific professional
+      allow create: if isAuthenticated()
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.status == 'OPEN';
+
+      // Updates allowed only according to state transitions and participant ownership
+      allow update: if isAuthenticated() && (
+        isAdmin() || (
+          // Customer can cancel OPEN or ACCEPTED requests
+          (resource.data.customerId == request.auth.uid && 
+           resource.data.status in ['OPEN', 'ACCEPTED'] && 
+           request.resource.data.status == 'CANCELLED')
+          ||
+          // Customer can confirm completion when COMPLETION_PENDING_CONFIRMATION
+          (resource.data.customerId == request.auth.uid && 
+           resource.data.status == 'COMPLETION_PENDING_CONFIRMATION' && 
+           request.resource.data.status == 'COMPLETED')
+          ||
+          // Customer transitions to REVIEWED upon submitting review
+          (resource.data.customerId == request.auth.uid && 
+           resource.data.status == 'COMPLETED' && 
+           request.resource.data.status == 'REVIEWED')
+          ||
+          // Professional can accept or reject an OPEN request
+          (resource.data.professionalId == request.auth.uid && 
+           resource.data.status == 'OPEN' && 
+           request.resource.data.status in ['ACCEPTED', 'REJECTED'])
+          ||
+          // Professional can mark ACCEPTED to IN_PROGRESS
+          (resource.data.professionalId == request.auth.uid && 
+           resource.data.status == 'ACCEPTED' && 
+           request.resource.data.status == 'IN_PROGRESS')
+          ||
+          // Professional can mark IN_PROGRESS to COMPLETION_PENDING_CONFIRMATION
+          (resource.data.professionalId == request.auth.uid && 
+           resource.data.status == 'IN_PROGRESS' && 
+           request.resource.data.status == 'COMPLETION_PENDING_CONFIRMATION')
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // --- 6. Request Status History collection ---
+    match /requestStatusHistory/{historyId} {
+      // Readable by participants or admin
+      allow read: if isAuthenticated();
+
+      // Written atomically alongside status transitions
+      allow create: if isAuthenticated()
+        && request.resource.data.changedBy == request.auth.uid;
+
+      allow update, delete: if false; // Audit records are immutable
+    }
+
+    // --- 7. Reviews collection (Doc ID == requestId) ---
+    match /reviews/{requestId} {
+      // Readable by all authenticated users
+      allow read: if isAuthenticated();
+
+      // Customer can create review only if they are the customer on the completed request
+      allow create: if isAuthenticated()
+        && request.resource.data.requestId == requestId
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.rating >= 1 
+        && request.resource.data.rating <= 5;
+
+      // Only admin can moderate / delete inappropriate reviews
+      allow update, delete: if isAdmin();
+    }
+
+    // --- 8. Admin Actions collection ---
+    match /adminActions/{actionId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
